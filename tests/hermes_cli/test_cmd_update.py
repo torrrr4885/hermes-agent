@@ -35,8 +35,68 @@ def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
 
 
 @pytest.fixture
-def mock_args():
+def mock_args(monkeypatch):
+    # Keep legacy updater tests hermetic even when the operator profile configures
+    # updates.managed_command for the real runtime.
+    monkeypatch.setenv("HERMES_UPDATE_DELEGATE_ACTIVE", "1")
+    monkeypatch.delenv("HERMES_UPDATE_COMMAND", raising=False)
     return SimpleNamespace()
+
+
+class TestCmdUpdateDelegation:
+    """cmd_update can delegate to an operator-managed update workflow."""
+
+    @patch("subprocess.run")
+    def test_update_delegates_to_env_managed_command(
+        self, mock_run, monkeypatch, mock_args, capsys
+    ):
+        monkeypatch.delenv("HERMES_UPDATE_DELEGATE_ACTIVE", raising=False)
+        monkeypatch.setenv(
+            "HERMES_UPDATE_COMMAND",
+            "python3 /tmp/update-hermes-runtime.py --runtime /tmp/runtime",
+        )
+        mock_args.check = True
+        mock_args.gateway = False
+        mock_args.backup = False
+        mock_args.no_backup = False
+        mock_args.yes = True
+        mock_run.return_value = subprocess.CompletedProcess([], 0)
+
+        cmd_update(mock_args)
+
+        mock_run.assert_called_once()
+        assert mock_run.call_args.args[0] == [
+            "python3",
+            "/tmp/update-hermes-runtime.py",
+            "--runtime",
+            "/tmp/runtime",
+            "--check",
+            "--yes",
+        ]
+        assert "Delegating Hermes update" in capsys.readouterr().out
+
+    @patch("subprocess.run")
+    def test_update_delegation_exits_on_managed_command_failure(
+        self, mock_run, monkeypatch, mock_args
+    ):
+        monkeypatch.delenv("HERMES_UPDATE_DELEGATE_ACTIVE", raising=False)
+        monkeypatch.setenv("HERMES_UPDATE_COMMAND", "python3 /tmp/update.py")
+        mock_args.check = False
+        mock_args.gateway = True
+        mock_args.backup = False
+        mock_args.no_backup = False
+        mock_args.yes = False
+        mock_run.return_value = subprocess.CompletedProcess([], 7)
+
+        with pytest.raises(SystemExit) as exc:
+            cmd_update(mock_args)
+
+        assert exc.value.code == 7
+        assert mock_run.call_args.args[0] == [
+            "python3",
+            "/tmp/update.py",
+            "--gateway",
+        ]
 
 
 class TestCmdUpdateBranchFallback:

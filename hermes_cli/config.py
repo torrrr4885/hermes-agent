@@ -1379,6 +1379,11 @@ DEFAULT_CONFIG = {
         # disable backups entirely, set ``pre_update_backup: false`` above
         # rather than ``backup_keep: 0``.
         "backup_keep": 5,
+        # Optional operator-managed update workflow.  When set, ``hermes update``
+        # delegates to this argv/string command instead of mutating the Hermes
+        # checkout directly.  Private fork runtimes can use this to enforce
+        # lockfile/test/push procedures while keeping the familiar CLI entrypoint.
+        "managed_command": "",
     },
 
     # Config schema version - bump this when adding new required fields

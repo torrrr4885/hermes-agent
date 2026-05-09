@@ -7044,6 +7044,66 @@ def _run_pre_update_backup(args) -> None:
     print()
 
 
+def _configured_update_command() -> list[str]:
+    """Return a configured operator-managed update command, if any.
+
+    ``HERMES_UPDATE_COMMAND`` is the emergency/launchd-friendly override.
+    ``updates.managed_command`` is the persistent profile config knob used by
+    private runtime operators (for example a fork-runtime workflow).  The
+    command may be either a shell-like string or a YAML list of argv parts.
+    """
+    import shlex
+
+    # Avoid accidental recursion if the managed updater itself needs to invoke
+    # Hermes for read-only subcommands.
+    if os.getenv("HERMES_UPDATE_DELEGATE_ACTIVE"):
+        return []
+
+    raw = os.getenv("HERMES_UPDATE_COMMAND", "").strip()
+    if not raw:
+        try:
+            from hermes_cli.config import load_config
+
+            updates = load_config().get("updates", {})
+            if isinstance(updates, dict):
+                raw = updates.get("managed_command") or ""
+        except Exception:
+            raw = ""
+
+    if not raw:
+        return []
+    if isinstance(raw, (list, tuple)):
+        return [str(part) for part in raw if str(part)]
+    return shlex.split(str(raw))
+
+
+def _delegate_update(args, command: list[str]) -> None:
+    """Run an operator-managed update workflow instead of the built-in updater."""
+    import shlex
+
+    passthrough: list[str] = []
+    for attr, flag in (
+        ("gateway", "--gateway"),
+        ("check", "--check"),
+        ("backup", "--backup"),
+        ("no_backup", "--no-backup"),
+        ("yes", "--yes"),
+    ):
+        if getattr(args, attr, False):
+            passthrough.append(flag)
+
+    final_cmd = [*command, *passthrough]
+    print("⚕ Delegating Hermes update to managed workflow...")
+    print("  " + " ".join(shlex.quote(part) for part in final_cmd))
+    print()
+    env = dict(os.environ)
+    env["HERMES_UPDATE_DELEGATE_ACTIVE"] = "1"
+    env.setdefault("HERMES_UPDATE_CALLER", "gateway" if getattr(args, "gateway", False) else "cli")
+    result = subprocess.run(final_cmd, env=env)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+
+
 def cmd_update(args):
     """Update Hermes Agent to the latest version.
 
@@ -7052,6 +7112,11 @@ def cmd_update(args):
     ``sys.exit`` or unhandled exceptions).
     """
     from hermes_cli.config import is_managed, managed_error
+
+    delegated_command = _configured_update_command()
+    if delegated_command:
+        _delegate_update(args, delegated_command)
+        return
 
     if is_managed():
         managed_error("update Hermes Agent")
