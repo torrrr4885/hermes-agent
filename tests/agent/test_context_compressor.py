@@ -1,4 +1,4 @@
-"""Tests for agent/context_compressor.py — compression logic, thresholds, truncation fallback."""
+"""Tests for agent/context_compressor.py — compression logic, thresholds, failure handling."""
 
 import pytest
 from unittest.mock import patch, MagicMock
@@ -64,20 +64,27 @@ class TestCompress:
         result = compressor.compress(msgs)
         assert result == msgs
 
-    def test_truncation_fallback_no_client(self, compressor):
-        # compressor has client=None, so should use truncation fallback
+    def test_no_provider_preserves_messages_and_marks_failure(self, compressor):
+        # With no auxiliary provider, compression must fail closed: preserve
+        # the transcript rather than dropping middle turns without a summary.
         msgs = [{"role": "system", "content": "System prompt"}] + self._make_messages(10)
         result = compressor.compress(msgs)
-        assert len(result) < len(msgs)
-        # Should keep system message and last N
-        assert result[0]["role"] == "system"
-        assert compressor.compression_count == 1
+        assert result == msgs
+        assert compressor.compression_count == 0
+        assert compressor._last_summary_fallback_used is True
+        assert compressor._last_summary_dropped_count == 0
+        assert compressor._last_summary_preserved_count > 0
 
     def test_compression_increments_count(self, compressor):
         msgs = self._make_messages(10)
-        compressor.compress(msgs)
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "structured summary"
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            compressor.compress(msgs)
         assert compressor.compression_count == 1
-        compressor.compress(msgs)
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            compressor.compress(msgs)
         assert compressor.compression_count == 2
 
     def test_protects_first_and_last(self, compressor):
@@ -128,7 +135,11 @@ class TestGenerateSummaryNoneContent:
             {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
             for i in range(10)
         ]
-        result = c.compress(msgs)
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "structured summary"
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs)
         assert len(result) < len(msgs)
 
 
@@ -497,7 +508,7 @@ class TestSummaryFailureTrackingForGatewayWarning:
     + fallback flag so gateway hygiene & /compress can surface a visible
     warning instead of silently dropping context."""
 
-    def test_compress_records_fallback_and_dropped_count_on_summary_failure(self):
+    def test_compress_preserves_messages_on_summary_failure(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
@@ -512,16 +523,19 @@ class TestSummaryFailureTrackingForGatewayWarning:
             {"role": "user", "content": "msg 7"},
         ]
 
-        # Simulate summary LLM call failing — covers the 404 / model-not-found
-        # case from issue (auxiliary compression model misconfigured).
-        with patch("agent.context_compressor.call_llm", side_effect=Exception("404 model not found")):
+        # Simulate summary LLM call failing — covers Codex timeouts / peer
+        # closes and model-not-found errors.  Compaction must fail closed:
+        # preserve the original transcript instead of replacing middle turns
+        # with an unsummarized placeholder.
+        with patch("agent.context_compressor.call_llm", side_effect=Exception("Codex timeout")):
             result = c.compress(msgs)
 
+        assert result == msgs
         assert c._last_summary_fallback_used is True
-        assert c._last_summary_dropped_count > 0
+        assert c._last_summary_dropped_count == 0
+        assert c._last_summary_preserved_count > 0
         assert c._last_summary_error is not None
-        # Result must still be well-formed (fallback summary present).
-        assert any(
+        assert not any(
             isinstance(m.get("content"), str) and "Summary generation was unavailable" in m["content"]
             for m in result
         )

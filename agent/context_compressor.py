@@ -366,6 +366,7 @@ class ContextCompressor(ContextEngine):
         self._previous_summary = None
         self._last_summary_error = None
         self._last_summary_dropped_count = 0
+        self._last_summary_preserved_count = 0
         self._last_summary_fallback_used = False
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
@@ -473,10 +474,11 @@ class ContextCompressor(ContextEngine):
         self._ineffective_compression_count: int = 0
         self._summary_failure_cooldown_until: float = 0.0
         self._last_summary_error: Optional[str] = None
-        # When summary generation fails and a static fallback is inserted,
-        # record how many turns were unrecoverably dropped so callers
-        # (gateway hygiene, /compress) can surface a visible warning.
+        # When summary generation fails, fail closed: preserve the original
+        # transcript and record how many turns would have been compacted so
+        # callers (gateway hygiene, /compress) can surface a visible warning.
         self._last_summary_dropped_count: int = 0
+        self._last_summary_preserved_count: int = 0
         self._last_summary_fallback_used: bool = False
         # When a user-configured summary model fails and we recover by
         # retrying on the main model, record the failure so gateway /
@@ -940,8 +942,8 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
             self._last_summary_error = "no auxiliary LLM provider configured"
             logging.warning("Context compression: no provider available for "
-                            "summary. Middle turns will be dropped without summary "
-                            "for %d seconds.",
+                            "summary. Compression will be skipped to preserve "
+                            "history for %d seconds.",
                             _SUMMARY_FAILURE_COOLDOWN_SECONDS)
             return None
         except Exception as e:
@@ -1336,6 +1338,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         # Reset per-call summary failure state — callers inspect these fields
         # after compress() returns to decide whether to surface a warning.
         self._last_summary_dropped_count = 0
+        self._last_summary_preserved_count = 0
         self._last_summary_fallback_used = False
         self._last_summary_error = None
         self._last_aux_model_failure_error = None
@@ -1352,6 +1355,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             return messages
 
         display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
+        original_messages = messages
 
         # Phase 1: Prune old tool results (cheap, no LLM call)
         messages, pruned_count = self._prune_old_tool_results(
@@ -1407,6 +1411,20 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         # Phase 3: Generate structured summary
         summary = self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
 
+        # If LLM summary failed, fail closed.  Do not replace the middle of
+        # the transcript with an unsummarized placeholder: that preserves token
+        # space but loses the user's actual history.  Returning the original
+        # transcript may mean the next LLM call still needs another strategy,
+        # but it is strictly safer than silently destroying context.
+        if not summary:
+            if not self.quiet_mode:
+                logger.warning("Summary generation failed — skipping context compression to preserve history")
+            n_preserved = compress_end - compress_start
+            self._last_summary_dropped_count = 0
+            self._last_summary_preserved_count = n_preserved
+            self._last_summary_fallback_used = True
+            return original_messages
+
         # Phase 4: Assemble compressed message list
         compressed = []
         for i in range(compress_start):
@@ -1420,22 +1438,6 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                         "\n\n" + _compression_note if isinstance(existing, str) and existing else _compression_note,
                     )
             compressed.append(msg)
-
-        # If LLM summary failed, insert a static fallback so the model
-        # knows context was lost rather than silently dropping everything.
-        if not summary:
-            if not self.quiet_mode:
-                logger.warning("Summary generation failed — inserting static fallback context marker")
-            n_dropped = compress_end - compress_start
-            self._last_summary_dropped_count = n_dropped
-            self._last_summary_fallback_used = True
-            summary = (
-                f"{SUMMARY_PREFIX}\n"
-                f"Summary generation was unavailable. {n_dropped} message(s) were "
-                f"removed to free context space but could not be summarized. The removed "
-                f"messages contained earlier work in this session. Continue based on the "
-                f"recent messages below and the current state of any files or resources."
-            )
 
         _merge_summary_into_tail = False
         last_head_role = messages[compress_start - 1].get("role", "user") if compress_start > 0 else "user"

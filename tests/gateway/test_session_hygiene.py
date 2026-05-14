@@ -398,9 +398,9 @@ async def test_session_hygiene_messages_stay_in_originating_topic(monkeypatch, t
 @pytest.mark.asyncio
 async def test_session_hygiene_warns_user_when_summary_generation_fails(monkeypatch, tmp_path):
     """When auxiliary compression's summary LLM call fails, the compressor
-    inserts a static fallback and the dropped turns are unrecoverable.
-    Gateway must surface a visible ⚠️ warning to the user, including
-    thread_id metadata so it lands in the originating topic/thread."""
+    preserves the transcript and skips compression. Gateway must surface a
+    visible ⚠️ warning to the user, including thread_id metadata so it lands
+    in the originating topic/thread."""
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -415,17 +415,18 @@ async def test_session_hygiene_warns_user_when_summary_generation_fails(monkeypa
             self.shutdown_memory_provider = MagicMock()
             self.close = MagicMock()
             # Simulate a compressor that hit summary-generation failure
-            # and inserted the static fallback placeholder.
+            # and skipped compression to preserve the transcript.
             self.context_compressor = SimpleNamespace(
                 _last_summary_fallback_used=True,
-                _last_summary_dropped_count=42,
+                _last_summary_dropped_count=0,
+                _last_summary_preserved_count=42,
                 _last_summary_error="404 model not found: gemini-3-flash-preview",
             )
             type(self).last_instance = self
 
         def _compress_context(self, messages, *_args, **_kwargs):
             self.session_id = f"{self.session_id}_compressed"
-            return ([{"role": "assistant", "content": "compressed"}], None)
+            return (list(messages), None)
 
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = FakeCompressAgentWithSummaryFailure
@@ -501,9 +502,11 @@ async def test_session_hygiene_warns_user_when_summary_generation_fails(monkeypa
         f"Expected 1 compression-failure warning, got {len(warning_messages)}: {adapter.sent}"
     )
     warn = warning_messages[0]
-    # Warning must include the dropped count and the underlying error.
+    # Warning must include the preserved count and the underlying error.
     assert "42" in warn["content"]
     assert "404" in warn["content"]
+    assert "No historical messages were removed" in warn["content"]
+    assert "compression was skipped" in warn["content"]
     # Warning must land in the originating topic/thread, not the main channel.
     assert warn["chat_id"] == "-1001"
     assert warn["metadata"] == {"thread_id": "17585"}

@@ -131,18 +131,11 @@ async def test_compress_command_explains_when_token_estimate_rises():
 
 @pytest.mark.asyncio
 async def test_compress_command_appends_warning_when_summary_generation_fails():
-    """When the auxiliary summariser fails and the compressor inserts a static
-    fallback placeholder, /compress must append a visible ⚠️ warning to its
-    reply. Otherwise the failure is silently logged and the user has no idea
-    earlier context is unrecoverable."""
+    """When the auxiliary summariser fails, /compress must append a visible
+    ⚠️ warning while preserving the transcript. Otherwise the failure is
+    silently logged and the user has no idea compression did not run."""
     history = _make_history()
-    # Compressed shape is irrelevant for this test — we only care that the
-    # warning surfaces. Drop one message so the headline is non-noop.
-    compressed = [
-        history[0],
-        {"role": "assistant", "content": "[fallback placeholder]"},
-        history[-1],
-    ]
+    compressed = list(history)
     runner = _make_runner(history)
     agent_instance = MagicMock()
     agent_instance.shutdown_memory_provider = MagicMock()
@@ -150,10 +143,11 @@ async def test_compress_command_appends_warning_when_summary_generation_fails():
     agent_instance._cached_system_prompt = ""
     agent_instance.tools = None
     agent_instance.context_compressor.has_content_to_compress.return_value = True
-    # Simulate summary-generation failure: fallback flag set, dropped count
-    # populated, error string captured.
+    # Simulate summary-generation failure: failure flag set, no dropped count,
+    # preserved count populated, error string captured.
     agent_instance.context_compressor._last_summary_fallback_used = True
-    agent_instance.context_compressor._last_summary_dropped_count = 7
+    agent_instance.context_compressor._last_summary_dropped_count = 0
+    agent_instance.context_compressor._last_summary_preserved_count = 7
     agent_instance.context_compressor._last_summary_error = (
         "404 model not found: gemini-3-flash-preview"
     )
@@ -175,16 +169,18 @@ async def test_compress_command_appends_warning_when_summary_generation_fails():
     ):
         result = await runner._handle_compress_command(_make_event())
 
-    # The compress reply itself still goes through (the transcript was rewritten).
-    assert "Compressed:" in result
-    # ...but a clearly-marked warning must be appended.
+    # The compress reply itself still goes through, but reports no transcript
+    # rewrite because failure now preserves history.
+    assert "No changes from compression" in result
+    # ...and a clearly-marked warning must be appended.
     assert "⚠️" in result
     assert "Summary generation failed" in result
-    # Underlying error must surface so users can fix their config.
+    # Underlying error must surface so users can fix their config/provider.
     assert "404 model not found" in result
-    # Dropped count must be visible — silently losing N messages is the bug.
+    # Preserved count must be visible — no history should be lost.
     assert "7" in result
-    assert "historical message(s) were removed" in result
+    assert "No historical messages were removed" in result
+    assert "compression was skipped" in result
     agent_instance.shutdown_memory_provider.assert_called_once()
     agent_instance.close.assert_called_once()
 

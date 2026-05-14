@@ -6758,24 +6758,36 @@ class GatewayRunner:
                                             f"{_new_tokens:,}",
                                         )
 
-                                    # If summary generation failed, the
-                                    # compressor inserted a static fallback
-                                    # placeholder and the dropped turns are
-                                    # gone for good.  Surface a visible
-                                    # warning to the gateway user — agent.log
-                                    # alone is invisible on TG/Discord/etc.
+                                    # If summary generation failed, surface a
+                                    # visible warning to the gateway user —
+                                    # agent.log alone is invisible on
+                                    # TG/Discord/etc.  New compressors fail
+                                    # closed (preserve history and skip
+                                    # compression); older session state may
+                                    # still report dropped placeholder turns.
                                     _comp = getattr(_hyg_agent, "context_compressor", None)
                                     if _comp is not None and getattr(_comp, "_last_summary_fallback_used", False):
                                         _dropped = getattr(_comp, "_last_summary_dropped_count", 0)
+                                        _preserved = getattr(_comp, "_last_summary_preserved_count", 0)
                                         _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
-                                        _warn_msg = (
-                                            "⚠️ Context compression summary failed "
-                                            f"({_err}). {_dropped} historical message(s) "
-                                            "were removed and replaced with a placeholder. "
-                                            "Earlier context is no longer recoverable. "
-                                            "Consider /reset for a clean session, or check "
-                                            "your auxiliary.compression model configuration."
-                                        )
+                                        if _dropped:
+                                            _warn_msg = (
+                                                "⚠️ Context compression summary failed "
+                                                f"({_err}). {_dropped} historical message(s) "
+                                                "were removed and replaced with a placeholder. "
+                                                "Earlier context is no longer recoverable. "
+                                                "Consider /reset for a clean session, or check "
+                                                "your auxiliary.compression model configuration."
+                                            )
+                                        else:
+                                            _warn_msg = (
+                                                "⚠️ Context compression summary failed "
+                                                f"({_err}). No historical messages were removed; "
+                                                "compression was skipped to preserve context"
+                                                + (f" ({_preserved} message(s) left intact)." if _preserved else ".")
+                                                + " The session may remain near the context limit; "
+                                                "check your auxiliary.compression model/provider."
+                                            )
                                         try:
                                             _adapter = self.adapters.get(source.platform)
                                             if _adapter and source.chat_id:
@@ -10058,6 +10070,7 @@ class GatewayRunner:
                 # path (otherwise the failure is silently logged).
                 _summary_failed = bool(getattr(compressor, "_last_summary_fallback_used", False))
                 _dropped_count = int(getattr(compressor, "_last_summary_dropped_count", 0) or 0)
+                _preserved_count = int(getattr(compressor, "_last_summary_preserved_count", 0) or 0)
                 _summary_err = getattr(compressor, "_last_summary_error", None)
                 # Separately: did the user's CONFIGURED aux model fail
                 # and we recovered via main?  Surface that as an info
@@ -10076,12 +10089,24 @@ class GatewayRunner:
             if summary["note"]:
                 lines.append(summary["note"])
             if _summary_failed:
-                lines.append(
-                    f"⚠️ Summary generation failed ({_summary_err or 'unknown error'}). "
-                    f"{_dropped_count} historical message(s) were removed and replaced "
-                    "with a placeholder; earlier context is no longer recoverable. "
-                    "Consider checking your auxiliary.compression model configuration."
-                )
+                if _dropped_count:
+                    lines.append(
+                        f"⚠️ Summary generation failed ({_summary_err or 'unknown error'}). "
+                        f"{_dropped_count} historical message(s) were removed and replaced "
+                        "with a placeholder; earlier context is no longer recoverable. "
+                        "Consider checking your auxiliary.compression model configuration."
+                    )
+                else:
+                    preserved_note = (
+                        f" {_preserved_count} message(s) were left intact."
+                        if _preserved_count else ""
+                    )
+                    lines.append(
+                        f"⚠️ Summary generation failed ({_summary_err or 'unknown error'}). "
+                        "No historical messages were removed; compression was skipped "
+                        f"to preserve context.{preserved_note} The session may remain near "
+                        "the context limit; check your auxiliary.compression model/provider."
+                    )
             elif _aux_fail_model:
                 lines.append(
                     f"ℹ️ Configured compression model `{_aux_fail_model}` failed "
