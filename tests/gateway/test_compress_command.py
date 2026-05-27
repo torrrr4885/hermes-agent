@@ -130,11 +130,11 @@ async def test_compress_command_explains_when_token_estimate_rises():
 
 
 @pytest.mark.asyncio
-async def test_compress_command_appends_warning_when_summary_generation_fails():
-    """When the auxiliary summariser fails, /compress must append a visible
-    ⚠️ warning while preserving the transcript. Otherwise the failure is
-    silently logged and the user has no idea compression did not run."""
+async def test_compress_command_appends_warning_when_compression_aborts():
+    """When the auxiliary summariser fails and the compressor aborts, /compress
+    must append a visible ⚠️ warning while preserving the transcript."""
     history = _make_history()
+    # Abort path: compressor returns the input messages unchanged.
     compressed = list(history)
     runner = _make_runner(history)
     agent_instance = MagicMock()
@@ -143,9 +143,10 @@ async def test_compress_command_appends_warning_when_summary_generation_fails():
     agent_instance._cached_system_prompt = ""
     agent_instance.tools = None
     agent_instance.context_compressor.has_content_to_compress.return_value = True
-    # Simulate summary-generation failure: failure flag set, no dropped count,
-    # preserved count populated, error string captured.
-    agent_instance.context_compressor._last_summary_fallback_used = True
+    # Simulate compression aborting (force=True bypassed cooldown but the
+    # aux LLM is genuinely broken).
+    agent_instance.context_compressor._last_compress_aborted = True
+    agent_instance.context_compressor._last_summary_fallback_used = False
     agent_instance.context_compressor._last_summary_dropped_count = 0
     agent_instance.context_compressor._last_summary_preserved_count = 7
     agent_instance.context_compressor._last_summary_error = (
@@ -158,7 +159,7 @@ async def test_compress_command_appends_warning_when_summary_generation_fails():
         if messages == history:
             return 100
         if messages == compressed:
-            return 60
+            return 100
         raise AssertionError(f"unexpected transcript: {messages!r}")
 
     with (
@@ -174,13 +175,11 @@ async def test_compress_command_appends_warning_when_summary_generation_fails():
     assert "No changes from compression" in result
     # ...and a clearly-marked warning must be appended.
     assert "⚠️" in result
-    assert "Summary generation failed" in result
+    assert "Compression aborted" in result
     # Underlying error must surface so users can fix their config/provider.
     assert "404 model not found" in result
-    # Preserved count must be visible — no history should be lost.
-    assert "7" in result
-    assert "No historical messages were removed" in result
-    assert "compression was skipped" in result
+    # User must be told nothing was dropped — the whole point is no silent data loss.
+    assert "No messages were dropped" in result
     agent_instance.shutdown_memory_provider.assert_called_once()
     agent_instance.close.assert_called_once()
 
@@ -206,6 +205,7 @@ async def test_compress_command_surfaces_aux_model_failure_even_when_recovered()
     agent_instance.tools = None
     agent_instance.context_compressor.has_content_to_compress.return_value = True
     # Fallback placeholder was NOT used — recovery succeeded.
+    agent_instance.context_compressor._last_compress_aborted = False
     agent_instance.context_compressor._last_summary_fallback_used = False
     agent_instance.context_compressor._last_summary_dropped_count = 0
     agent_instance.context_compressor._last_summary_error = None
